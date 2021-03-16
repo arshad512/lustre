@@ -1,0 +1,585 @@
+From 611406e29293c37b4a8771073030ccdaf0bd4fa5 Mon Sep 17 00:00:00 2001
+From: Li Xi <pkuelelixi@gmail.com>
+Subject: [PATCH] vfs: Add general support to enforce project quota limits
+
+This patch adds support for a new quota type PRJQUOTA for project quota
+enforcement. Also a new method get_projid() is added into dquot_operations
+structure.
+
+Signed-off-by: Li Xi <lixi@ddn.com>
+Signed-off-by: Dmitry Monakhov <dmonakhov@openvz.org>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Jan Kara <jack@suse.cz>
+----
+
+diff --git a/fs/quota/dquot.c b/fs/quota/dquot.c
+index d7d5a0a..6b80f11 100644
+--- a/fs/quota/dquot.c
++++ b/fs/quota/dquot.c
+@@ -1152,8 +1152,8 @@ static int need_print_warning(struct dquot_warn *warn)
+ 			return uid_eq(current_fsuid(), warn->w_dq_id.uid);
+ 		case GRPQUOTA:
+ 			return in_group_p(warn->w_dq_id.gid);
+-		case PRJQUOTA:	/* Never taken... Just make gcc happy */
+-			return 0;
++		case PRJQUOTA:
++			return 1;
+ 	}
+ 	return 0;
+ }
+@@ -1392,6 +1392,9 @@ static void __dquot_initialize(struct inode *inode, int type)
+ 	/* First get references to structures we might need. */
+ 	for (cnt = 0; cnt < MAXQUOTAS; cnt++) {
+ 		struct kqid qid;
++		kprojid_t projid;
++		int rc;
++
+ 		got[cnt] = NULL;
+ 		if (type != -1 && cnt != type)
+ 			continue;
+@@ -1402,6 +1405,10 @@ static void __dquot_initialize(struct inode *inode, int type)
+ 		 */
+ 		if (inode->i_dquot[cnt])
+ 			continue;
++
++		if (!sb_has_quota_active(sb, cnt))
++			continue;
++
+ 		init_needed = 1;
+ 
+ 		switch (cnt) {
+@@ -1411,6 +1418,12 @@ static void __dquot_initialize(struct inode *inode, int type)
+ 		case GRPQUOTA:
+ 			qid = make_kqid_gid(inode->i_gid);
+ 			break;
++		case PRJQUOTA:
++			rc = inode->i_sb->dq_op->get_projid(inode, &projid);
++			if (rc)
++				continue;
++			qid = make_kqid_projid(projid);
++			break;
+ 		}
+ 		got[cnt] = dqget(sb, qid);
+ 	}
+@@ -2154,7 +2167,8 @@ static int vfs_load_quota_inode(struct inode *inode, int type, int format_id,
+ 		error = -EROFS;
+ 		goto out_fmt;
+ 	}
+-	if (!sb->s_op->quota_write || !sb->s_op->quota_read) {
++	if (!sb->s_op->quota_write || !sb->s_op->quota_read ||
++	    (type == PRJQUOTA && sb->dq_op->get_projid == NULL)) {
+ 		error = -EINVAL;
+ 		goto out_fmt;
+ 	}
+diff --git a/fs/quota/quotaio_v2.h b/fs/quota/quotaio_v2.h
+index f1966b4..4e95430 100644
+--- a/fs/quota/quotaio_v2.h
++++ b/fs/quota/quotaio_v2.h
+@@ -13,12 +13,14 @@
+  */
+ #define V2_INITQMAGICS {\
+ 	0xd9c01f11,	/* USRQUOTA */\
+-	0xd9c01927	/* GRPQUOTA */\
++	0xd9c01927,	/* GRPQUOTA */\
++	0xd9c03f14,	/* PRJQUOTA */\
+ }
+ 
+ #define V2_INITQVERSIONS {\
+ 	1,		/* USRQUOTA */\
+-	1		/* GRPQUOTA */\
++	1,		/* GRPQUOTA */\
++	1,		/* PRJQUOTA */\
+ }
+ 
+ /* First generic header */
+diff --git a/include/linux/quota.h b/include/linux/quota.h
+index 99932a5..0d20c39 100644
+--- a/include/linux/quota.h
++++ b/include/linux/quota.h
+@@ -52,6 +52,7 @@
+ 
+ #undef USRQUOTA
+ #undef GRPQUOTA
++#undef PRJQUOTA
+ enum quota_type {
+ 	USRQUOTA = 0,		/* element used for user quotas */
+ 	GRPQUOTA = 1,		/* element used for group quotas */
+@@ -314,6 +315,7 @@ struct dquot_operations {
+ 	/* get reserved quota for delayed alloc, value returned is managed by
+ 	 * quota code only */
+ 	qsize_t *(*get_reserved_space) (struct inode *);
++	int (*get_projid) (struct inode *, kprojid_t *);/* Get project ID */
+ };
+ 
+ struct path;
+diff --git a/include/uapi/linux/fs.h b/include/uapi/linux/fs.h
+index 83d19df..418e9dd 100644
+--- a/include/uapi/linux/fs.h
++++ b/include/uapi/linux/fs.h
+@@ -58,6 +58,36 @@ struct inodes_stat_t {
+ 	int dummy[5];		/* padding for sysctl ABI compatibility */
+ };
+ 
++/*
++ * Structure for FS_IOC_FSGETXATTR and FS_IOC_FSSETXATTR.
++ */
++struct fsxattr {
++	__u32		fsx_xflags;	/* xflags field value (get/set) */
++	__u32		fsx_extsize;	/* extsize field value (get/set)*/
++	__u32		fsx_nextents;	/* nextents field value (get)	*/
++	__u32		fsx_projid;	/* project identifier (get/set) */
++	unsigned char	fsx_pad[12];
++};
++#define HAVE_FSXATTR		1
++
++/*
++ * Flags for the fsx_xflags field
++ */
++#define FS_XFLAG_REALTIME	0x00000001	/* data in realtime volume */
++#define FS_XFLAG_PREALLOC	0x00000002	/* preallocated file extents */
++#define FS_XFLAG_IMMUTABLE	0x00000008	/* file cannot be modified */
++#define FS_XFLAG_APPEND		0x00000010	/* all writes append */
++#define FS_XFLAG_SYNC		0x00000020	/* all writes synchronous */
++#define FS_XFLAG_NOATIME	0x00000040	/* do not update access time */
++#define FS_XFLAG_NODUMP		0x00000080	/* do not include in backups */
++#define FS_XFLAG_RTINHERIT	0x00000100	/* create with rt bit set */
++#define FS_XFLAG_PROJINHERIT	0x00000200	/* create with parents projid */
++#define FS_XFLAG_NOSYMLINKS	0x00000400	/* disallow symlink creation */
++#define FS_XFLAG_EXTSIZE	0x00000800	/* extent size allocator hint */
++#define FS_XFLAG_EXTSZINHERIT	0x00001000	/* inherit inode extent size */
++#define FS_XFLAG_NODEFRAG	0x00002000  	/* do not defragment */
++#define FS_XFLAG_FILESTREAM	0x00004000	/* use filestream allocator */
++#define FS_XFLAG_HASATTR	0x80000000	/* no DIFLAG for this */
+ 
+ #define NR_FILE  8192	/* this can well be larger on a larger system */
+ 
+@@ -163,6 +193,8 @@ struct inodes_stat_t {
+ #define	FS_IOC_GETVERSION		_IOR('v', 1, long)
+ #define	FS_IOC_SETVERSION		_IOW('v', 2, long)
+ #define FS_IOC_FIEMAP			_IOWR('f', 11, struct fiemap)
++#define FS_IOC_FSGETXATTR		_IOR('X', 31, struct fsxattr)
++#define FS_IOC_FSSETXATTR		_IOW('X', 32, struct fsxattr)
+ #define FS_IOC32_GETFLAGS		_IOR('f', 1, int)
+ #define FS_IOC32_SETFLAGS		_IOW('f', 2, int)
+ #define FS_IOC32_GETVERSION		_IOR('v', 1, int)
+@@ -195,6 +227,7 @@ struct inodes_stat_t {
+ #define FS_EXTENT_FL			0x00080000 /* Extents */
+ #define FS_DIRECTIO_FL			0x00100000 /* Use direct i/o */
+ #define FS_NOCOW_FL			0x00800000 /* Do not cow file */
++#define FS_PROJINHERIT_FL		0x20000000 /* Create with parents projid */
+ #define FS_RESERVED_FL			0x80000000 /* reserved for ext2 lib */
+ 
+ #define FS_FL_USER_VISIBLE		0x0003DFFF /* User visible flags */
+diff --git a/include/uapi/linux/quota.h b/include/uapi/linux/quota.h
+index 3b6cfbe..b2d9486 100644
+--- a/include/uapi/linux/quota.h
++++ b/include/uapi/linux/quota.h
+@@ -36,11 +36,12 @@
+ #include <linux/errno.h>
+ #include <linux/types.h>
+ 
+-#define __DQUOT_VERSION__	"dquot_6.5.2"
++#define __DQUOT_VERSION__	"dquot_6.6.0"
+ 
+-#define MAXQUOTAS 2
++#define MAXQUOTAS 3
+ #define USRQUOTA  0		/* element used for user quotas */
+ #define GRPQUOTA  1		/* element used for group quotas */
++#define PRJQUOTA  2		/* element used for project quotas */
+ 
+ /*
+  * Definitions for the default names of the quotas files.
+@@ -48,6 +49,7 @@
+ #define INITQFNAMES { \
+ 	"user",    /* USRQUOTA */ \
+ 	"group",   /* GRPQUOTA */ \
++	"project", /* PRJQUOTA */ \
+ 	"undefined", \
+ };
+ 
+bio_integrity_verify() doesn't verify the data integrity at all.
+In that function, after reading the data, bio->bi_idx will be
+equal to bio->bi_vcnt because of bio_advance(),
+so bio_for_each_segment_all() should be used, not
+bio_for_each_segment().
+bio_advance() should not change the integrity data
+bio_integrity_advance() unless the BIO is being trimmed.
+Linux-commit: 63573e359d052e506d305c263576499f06355985
+
+Index: linux-3.10.0-693.21.1.el7.x86_64/fs/bio.c
+===================================================================
+--- linux-3.10.0-693.21.1.el7.x86_64.orig/fs/bio.c
++++ linux-3.10.0-693.21.1.el7.x86_64/fs/bio.c
+@@ -870,9 +870,6 @@ EXPORT_SYMBOL(submit_bio_wait);
+  */
+ void bio_advance(struct bio *bio, unsigned bytes)
+ {
+-	if (bio_integrity(bio))
+-		bio_integrity_advance(bio, bytes);
+-
+ 	bio->bi_sector += bytes >> 9;
+ 	bio->bi_size -= bytes;
+ 
+@@ -1973,6 +1970,9 @@ void bio_trim(struct bio *bio, int offse
+ 
+ 	clear_bit(BIO_SEG_VALID, &bio->bi_flags);
+ 
++	if (bio_integrity(bio))
++		bio_integrity_advance(bio, offset << 9);
++
+ 	bio_advance(bio, offset << 9);
+ 
+ 	bio->bi_size = size;
+Index: linux-3.10.0-693.21.1.el7.x86_64/fs/bio-integrity.c
+===================================================================
+--- linux-3.10.0-693.21.1.el7.x86_64.orig/fs/bio-integrity.c
++++ linux-3.10.0-693.21.1.el7.x86_64/fs/bio-integrity.c
+@@ -463,7 +463,11 @@ static int bio_integrity_verify(struct b
+ 	bix.disk_name = bio->bi_bdev->bd_disk->disk_name;
+ 	bix.sector_size = bi->sector_size;
+ 
+-	bio_for_each_segment(bv, bio, i) {
++	/*
++	 * bio->bi_idx might be equal to bio->bi_vcnt after __bio_advance(),
++	 * So use bio_for_each_segment_all() not bio_for_each_segment().
++	 */
++	bio_for_each_segment_all(bv, bio, i) {
+ 		void *kaddr = kmap_atomic(bv->bv_page);
+ 		bix.data_buf = kaddr + bv->bv_offset;
+ 		bix.data_size = bv->bv_len;
+When sector offset is larger then 2^32, the mapping from physical
+reference tag to the virtual values expected by block layer will be
+wrong.
+Linux-commit: c611529e7cd3465ec0eada0f44200e8420c38908
+
+Index: linux-3.10.0-693.21.1.el7.x86_64/drivers/scsi/sd_dif.c
+===================================================================
+--- linux-3.10.0-693.21.1.el7.x86_64.orig/drivers/scsi/sd_dif.c
++++ linux-3.10.0-693.21.1.el7.x86_64/drivers/scsi/sd_dif.c
+@@ -416,6 +416,7 @@ void sd_dif_complete(struct scsi_cmnd *s
+ 	struct sd_dif_tuple *sdt;
+ 	unsigned int i, j, sectors, sector_sz;
+ 	u32 phys, virt;
++	sector_t sector;
+ 
+ 	sdkp = scsi_disk(scmd->request->rq_disk);
+ 
+@@ -425,9 +426,10 @@ void sd_dif_complete(struct scsi_cmnd *s
+ 	sector_sz = scmd->device->sector_size;
+ 	sectors = good_bytes / sector_sz;
+ 
+-	phys = blk_rq_pos(scmd->request) & 0xffffffff;
++	sector = blk_rq_pos(scmd->request);
+ 	if (sector_sz == 4096)
+-		phys >>= 3;
++		sector >>= 3;
++	phys = sector & 0xffffffff;
+ 
+ 	__rq_for_each_bio(bio, scmd->request) {
+ 		struct bio_vec *iv;
+This adds optional integrity functions for given bio, they are
+passsed to bio_integrity_prep and initialized in
+bio_integrity_payload.
+The optional integrity generate/verify functions take priority
+over the ones registered on the block device.
+
+It brings flexibility to bio integrity handling. e.g. a network
+filesystem with integrity support would have integrity
+generation happen on the clients, and send them over the wire.
+On the server side once we receive the integrity bits and pass
+the network layer checksums we would merely pass it on to the
+block devices have integrity support, so we don't have to
+calculate the integrity again.
+Verification shares the same principle: on the server we just
+copy the integrity bits from the device and send them through
+the wire, then the verification happens on the clients.
+
+Index: linux-3.10.0-862.9.1.el7/fs/bio-integrity.c
+===================================================================
+--- linux-3.10.0-862.9.1.el7.orig/fs/bio-integrity.c
++++ linux-3.10.0-862.9.1.el7/fs/bio-integrity.c
+@@ -38,7 +38,7 @@ void blk_flush_integrity(void)
+ }
+ 
+ /**
+- * bio_integrity_alloc - Allocate integrity payload and attach it to bio
++ * bio_integrity_alloc_fn - Allocate integrity payload and attach it to bio
+  * @bio:	bio to attach integrity metadata to
+  * @gfp_mask:	Memory allocation mask
+  * @nr_vecs:	Number of integrity metadata scatter-gather elements
+@@ -47,9 +47,11 @@ void blk_flush_integrity(void)
+  * metadata.  nr_vecs specifies the maximum number of pages containing
+  * integrity metadata that can be attached.
+  */
+-struct bio_integrity_payload *bio_integrity_alloc(struct bio *bio,
+-						  gfp_t gfp_mask,
+-						  unsigned int nr_vecs)
++struct bio_integrity_payload *bio_integrity_alloc_fn(struct bio *bio,
++						     gfp_t gfp_mask,
++						     unsigned int nr_vecs,
++						     integrity_gen_fn *generate_fn,
++						     integrity_vrfy_fn *verify_fn)
+ {
+ 	struct bio_integrity_payload *bip;
+ 	struct bio_set *bs = bio->bi_pool;
+@@ -81,6 +83,8 @@ struct bio_integrity_payload *bio_integr
+ 
+ 	bip->bip_slab = idx;
+ 	bip->bip_bio = bio;
++	bip->bip_generate_fn = generate_fn;
++	bip->bip_verify_fn = verify_fn;
+ 	bio->bi_integrity = bip;
+ 
+ 	return bip;
+@@ -88,6 +92,13 @@ err:
+ 	mempool_free(bip, bs->bio_integrity_pool);
+ 	return NULL;
+ }
++EXPORT_SYMBOL(bio_integrity_alloc_fn);
++
++struct bio_integrity_payload *bio_integrity_alloc(struct bio *bio, gfp_t gfp,
++						  unsigned int nr)
++{
++	return bio_integrity_alloc_fn(bio, gfp, nr, NULL, NULL);
++}
+ EXPORT_SYMBOL(bio_integrity_alloc);
+ 
+ /**
+@@ -312,10 +323,12 @@ static void bio_integrity_generate(struc
+ {
+ 	struct blk_integrity *bi = bdev_get_integrity(bio->bi_bdev);
+ 	struct blk_integrity_exchg bix;
++	struct bio_integrity_payload *bip = bio->bi_integrity;
+ 	struct bio_vec *bv;
+ 	sector_t sector = bio->bi_sector;
+ 	unsigned int i, sectors, total;
+ 	void *prot_buf = bio->bi_integrity->bip_buf;
++	integrity_gen_fn *generate_fn = bip->bip_generate_fn ?: bi->generate_fn;
+ 
+ 	total = 0;
+ 	bix.disk_name = bio->bi_bdev->bd_disk->disk_name;
+@@ -328,7 +341,7 @@ static void bio_integrity_generate(struc
+ 		bix.prot_buf = prot_buf;
+ 		bix.sector = sector;
+ 
+-		bi->generate_fn(&bix);
++		generate_fn(&bix);
+ 
+ 		sectors = bv->bv_len / bi->sector_size;
+ 		sector += sectors;
+@@ -349,7 +362,7 @@ static inline unsigned short blk_integri
+ }
+ 
+ /**
+- * bio_integrity_prep - Prepare bio for integrity I/O
++ * bio_integrity_prep_fn - Prepare bio for integrity I/O
+  * @bio:	bio to prepare
+  *
+  * Description: Allocates a buffer for integrity metadata, maps the
+@@ -359,7 +372,8 @@ static inline unsigned short blk_integri
+  * block device's integrity function.  In the READ case, the buffer
+  * will be prepared for DMA and a suitable end_io handler set up.
+  */
+-int bio_integrity_prep(struct bio *bio)
++int bio_integrity_prep_fn(struct bio *bio, integrity_gen_fn *generate_fn,
++			  integrity_vrfy_fn *verify_fn)
+ {
+ 	struct bio_integrity_payload *bip;
+ 	struct blk_integrity *bi;
+@@ -390,7 +404,8 @@ int bio_integrity_prep(struct bio *bio)
+ 	nr_pages = end - start;
+ 
+ 	/* Allocate bio integrity payload and integrity vectors */
+-	bip = bio_integrity_alloc(bio, GFP_NOIO, nr_pages);
++	bip = bio_integrity_alloc_fn(bio, GFP_NOIO, nr_pages,
++				     generate_fn, verify_fn);
+ 	if (unlikely(bip == NULL)) {
+ 		printk(KERN_ERR "could not allocate data integrity bioset\n");
+ 		kfree(buf);
+@@ -440,6 +455,12 @@ int bio_integrity_prep(struct bio *bio)
+ 
+ 	return 0;
+ }
++EXPORT_SYMBOL(bio_integrity_prep_fn);
++
++int bio_integrity_prep(struct bio *bio)
++{
++	return bio_integrity_prep_fn(bio, NULL, NULL);
++}
+ EXPORT_SYMBOL(bio_integrity_prep);
+ 
+ /**
+@@ -454,10 +475,13 @@ static int bio_integrity_verify(struct b
+ {
+ 	struct blk_integrity *bi = bdev_get_integrity(bio->bi_bdev);
+ 	struct blk_integrity_exchg bix;
++	struct bio_integrity_payload *bip = bio->bi_integrity;
+ 	struct bio_vec *bv;
+ 	sector_t sector = bio->bi_integrity->bip_sector;
+ 	unsigned int i, sectors, total, ret;
+ 	void *prot_buf = bio->bi_integrity->bip_buf;
++	integrity_vrfy_fn *verify_fn = bip->bip_verify_fn ?:
++					bi->verify_fn;
+ 
+ 	ret = total = 0;
+ 	bix.disk_name = bio->bi_bdev->bd_disk->disk_name;
+@@ -474,7 +498,7 @@ static int bio_integrity_verify(struct b
+ 		bix.prot_buf = prot_buf;
+ 		bix.sector = sector;
+ 
+-		ret = bi->verify_fn(&bix);
++		ret = verify_fn(&bix);
+ 
+ 		if (ret) {
+ 			kunmap_atomic(kaddr);
+@@ -711,7 +735,9 @@ int bio_integrity_clone(struct bio *bio,
+ 
+ 	BUG_ON(bip_src == NULL);
+ 
+-	bip = bio_integrity_alloc(bio, gfp_mask, bip_src->bip_vcnt);
++	bip = bio_integrity_alloc_fn(bio, gfp_mask, bip_src->bip_vcnt,
++				     bip_src->bip_generate_fn,
++				     bip_src->bip_verify_fn);
+ 
+ 	if (bip == NULL)
+ 		return -EIO;
+Index: linux-3.10.0-862.9.1.el7/include/linux/bio.h
+===================================================================
+--- linux-3.10.0-862.9.1.el7.orig/include/linux/bio.h
++++ linux-3.10.0-862.9.1.el7/include/linux/bio.h
+@@ -195,6 +195,11 @@ struct bio_integrity_payload {
+ 	struct work_struct	bip_work;	/* I/O completion */
+ 
+ 	struct bio_vec		*bip_vec;
++
++	/* put after bip_vec as that is last externally-accessed bip_ field */
++	integrity_gen_fn	*bip_generate_fn;
++	integrity_vrfy_fn	*bip_verify_fn;
++ 
+ 	struct bio_vec		bip_inline_vecs[0];/* embedded bvec array */
+ };
+ #endif /* CONFIG_BLK_DEV_INTEGRITY */
+@@ -618,6 +623,11 @@ struct biovec_slab {
+ #define bio_integrity(bio) (bio->bi_integrity != NULL)
+ 
+ extern struct bio_integrity_payload *bio_integrity_alloc(struct bio *, gfp_t, unsigned int);
++extern struct bio_integrity_payload *bio_integrity_alloc_fn(struct bio *bio,
++						gfp_t gfp_mask,
++						unsigned int nr_vecs,
++						integrity_gen_fn *generate_fn,
++						integrity_vrfy_fn *verify_fn);
+ extern void bio_integrity_free(struct bio *);
+ extern int bio_integrity_add_page(struct bio *, struct page *, unsigned int, unsigned int);
+ extern int bio_integrity_enabled(struct bio *bio);
+@@ -624,6 +634,9 @@ struct biovec_slab {
+ extern int bio_integrity_set_tag(struct bio *, void *, unsigned int);
+ extern int bio_integrity_get_tag(struct bio *, void *, unsigned int);
+ extern int bio_integrity_prep(struct bio *);
++extern int bio_integrity_prep_fn(struct bio *bio,
++				 integrity_gen_fn *generate_fn,
++				 integrity_vrfy_fn *verify_fn);
+ extern void bio_integrity_endio(struct bio *, int);
+ extern void bio_integrity_advance(struct bio *, unsigned int);
+ extern void bio_integrity_trim(struct bio *, unsigned int, unsigned int);
+Index: linux-3.10.0-862.9.1.el7/include/linux/blk_types.h
+===================================================================
+--- linux-3.10.0-862.9.1.el7.orig/include/linux/blk_types.h
++++ linux-3.10.0-862.9.1.el7/include/linux/blk_types.h
+@@ -16,8 +16,11 @@ struct page;
+ struct block_device;
+ struct io_context;
+ struct cgroup_subsys_state;
++struct blk_integrity_exchg;
+ typedef void (bio_end_io_t) (struct bio *, int);
+ typedef void (bio_destructor_t) (struct bio *);
++typedef void (integrity_gen_fn) (struct blk_integrity_exchg *bix);
++typedef int (integrity_vrfy_fn) (struct blk_integrity_exchg *bix);
+ 
+ /*
+  * was unsigned short, but we might as well be ready for > 64kB I/O pages
+Index: linux-3.10.0-862.9.1.el7/include/linux/blkdev.h
+===================================================================
+--- linux-3.10.0-862.9.1.el7.orig/include/linux/blkdev.h
++++ linux-3.10.0-862.9.1.el7/include/linux/blkdev.h
+@@ -1702,8 +1702,6 @@ struct blk_integrity_exchg {
+ 	const char		*disk_name;
+ };
+ 
+-typedef void (integrity_gen_fn) (struct blk_integrity_exchg *);
+-typedef int (integrity_vrfy_fn) (struct blk_integrity_exchg *);
+ typedef void (integrity_set_tag_fn) (void *, void *, unsigned int);
+ typedef void (integrity_get_tag_fn) (void *, void *, unsigned int);
+ 
+Having struct bio allows us to do more in the genrate/verify_fn,
+like copying a known good guard tag already available rather than
+calculating it.
+
+Index: linux-3.10.0-862.9.1.el7/fs/bio-integrity.c
+===================================================================
+--- linux-3.10.0-862.9.1.el7.orig/fs/bio-integrity.c
++++ linux-3.10.0-862.9.1.el7/fs/bio-integrity.c
+@@ -334,6 +334,8 @@ static void bio_integrity_generate(struc
+ 		bix.data_size = bv->bv_len;
+ 		bix.prot_buf = prot_buf;
+ 		bix.sector = sector;
++		bix.bi_idx = i;
++		bix.bio = bio;
+ 
+ 		generate_fn(&bix);
+ 
+@@ -485,6 +487,8 @@ static int bio_integrity_verify(struct b
+ 		bix.data_size = bv->bv_len;
+ 		bix.prot_buf = prot_buf;
+ 		bix.sector = sector;
++		bix.bi_idx = i;
++		bix.bio = bio;
+ 
+ 		ret = verify_fn(&bix);
+ 
+Index: linux-3.10.0-862.9.1.el7/include/linux/blkdev.h
+===================================================================
+--- linux-3.10.0-862.9.1.el7.orig/include/linux/blkdev.h
++++ linux-3.10.0-862.9.1.el7/include/linux/blkdev.h
+@@ -1699,7 +1699,9 @@ struct blk_integrity_exchg {
+ 	sector_t		sector;
+ 	unsigned int		data_size;
+ 	unsigned short		sector_size;
++	unsigned short		bi_idx;
+ 	const char		*disk_name;
++	struct bio		*bio;
+ };
+ 
+ typedef void (integrity_set_tag_fn) (void *, void *, unsigned int);
+From e69f18f06b97ed29645d020500222bfcec2b42b2 Mon Sep 17 00:00:00 2001
+From: "Martin K. Petersen" <martin.petersen@oracle.com>
+Date: Tue, 8 Apr 2014 22:59:31 -0400
+Subject: [PATCH] block: Ensure we only enable integrity metadata for reads and
+ writes
+
+We'd occasionally attempt to generate protection information for flushes
+and other requests with a zero payload. Make sure we only attempt to
+enable integrity for reads and writes.
+
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Jens Axboe <axboe@fb.com>
+---
+ fs/bio-integrity.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/fs/bio-integrity.c b/fs/bio-integrity.c
+index b355b98dbf1b..1c2ce0c87711 100644
+--- a/fs/bio-integrity.c
++++ b/fs/bio-integrity.c
+@@ -182,6 +182,9 @@ static int bdev_integrity_enabled(struct block_device *bdev, int rw)
+  */
+ int bio_integrity_enabled(struct bio *bio)
+ {
++	if (!bio_is_rw(bio))
++		return 0;
++
+ 	/* Already protected? */
+ 	if (bio_integrity(bio))
+ 		return 0;
+-- 
+2.26.1
+
