@@ -1,0 +1,19 @@
+Building CentOS Kernel from source + applying lustre patches
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+build_centos_with_lustre_patches.sh takes three inputs (specifed by LOC) and
+builds CentOS kernel from source.
+
+First input is the .config file which is named as "kernel-3.10.0-x86_64.config"
+Second input is the lustre patch to be applied which is named as "patch-3.10.0-lustre.patch"
+Third input is the kernel.spec file.
+
+How to obtain these three input files are described in the .sh file. Once
+these are present it is a simply matter of running the build_centos_with_lustre_patches.sh
+script.
+
+Eg. LOC=/root/rpmbuild/ bash ./build_centos_with_lustre_patches.sh
+
+If everything goes will, this will result in new RPMs being created and saved
+under /root/rpmbuild/staging01/rpmbuild/RPMS/x86_64/
+
